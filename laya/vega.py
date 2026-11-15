@@ -425,7 +425,7 @@ class VegaAgent(Agent):
         active = compose_hooks(self.hooks, hooks, on_predict_start, on_predict_end)
         raise_errors = self.hooks_raise if hooks_raise is None else bool(hooks_raise)
         timeout = self.hooks_timeout if hooks_timeout is None else validate_timeout(hooks_timeout)
-        ctx = PredictContext(states=state, questions=questions, model=self.model_id, agent=self,
+        ctx = PredictContext(states=[state], questions=questions, model=self.model_id, agent=self,
                              max_len=max_len, head_max_len=head_max_len)
         try:
             dispatch(active, "on_predict_start", ctx, raise_errors=raise_errors,
@@ -434,17 +434,20 @@ class VegaAgent(Agent):
             if long_read is not None:
                 long_read["skipped"] = ctx.results is not None
             if ctx.results is not None:
-                out = ctx.results
-                if isinstance(out, (list, tuple)) and len(out) == 1:
-                    out = out[0]
-                if isinstance(out, dict):
-                    ctx.usage = out.get("usage")
+                # Keep accepting Vega's legacy single-dict skip payload at the boundary,
+                # but give end hooks the common PredictContext collection shape.
+                if isinstance(ctx.results, dict):
+                    ctx.results = [ctx.results]
+                elif isinstance(ctx.results, tuple):
+                    ctx.results = list(ctx.results)
+                if len(ctx.results) == 1:
+                    ctx.usage = ctx.results[0].get("usage")
             else:
-                out = self._decide(ctx.states, ctx.questions, lang=lang, image=image,
+                out = self._decide(ctx.states[0], ctx.questions, lang=lang, image=image,
                                    audio=audio, video=video, frames=frames, mode=mode,
                                    views=views, min_confidence=min_confidence, asr=asr,
                                    language=language, sampling_rate=sampling_rate)
-                ctx.results = out
+                ctx.results = [out]
                 ctx.usage = out.get("usage")
         except BaseException as exc:
             ctx.error = exc
@@ -945,9 +948,16 @@ class VegaAgent(Agent):
     def save_calibration(self, path: str) -> Dict[str, Any]:
         """Heads and calibration to ``path`` (a directory), reloadable with
         :meth:`load_calibration`. vegaml's heads have no save of their own, so the arrays are
-        written here; the Calibration is vegaml's own JSON."""
+        written here; the Calibration is vegaml's own JSON. An uncalibrated agent must use
+        a fresh directory if the destination already holds calibration.json; the existing
+        policy is preserved rather than mixing old calibration with new heads."""
         import numpy as np
 
+        if self.calibration is None and os.path.lexists(os.path.join(path, "calibration.json")):
+            raise ValueError(
+                "cannot save an uncalibrated policy to a directory containing "
+                "calibration.json; use a fresh directory to preserve the existing policy"
+            )
         os.makedirs(path, exist_ok=True)
         arrays, meta = {}, {"heads": {}, "model": self.model_id, "alpha": self.alpha,
                             "risk": self.risk, "target_precision": self.target_precision}

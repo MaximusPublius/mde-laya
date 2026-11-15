@@ -114,6 +114,40 @@ def test_predict_hands_media_and_long_states_to_vega_and_stamps_the_routing():
         r.predict(ENGLISH, Q, video="c")
 
 
+def test_attached_fitted_heads_route_after_eviction_and_restore(monkeypatch):
+    stub = _StubVega(heads=("dept",))
+    r = Router(vega=stub, max_loaded=1)
+    q = {"dept": Q["dept"]}
+    assert r.route(ENGLISH, q).model == VEGA_MODEL
+    original_build = r._build
+    monkeypatch.setattr(r, "_build", lambda key: object() if key == "english" else original_build(key))
+    r.load("english")
+    assert VEGA_MODEL not in r.loaded and r._vega_spec is stub
+    assert r.route(ENGLISH, q).model == VEGA_MODEL
+    out = r.predict(ENGLISH, q)
+    assert out["routing"]["model"] == VEGA_MODEL
+    assert r.load(VEGA_MODEL) is stub and stub.calls[-1]["state"] == ENGLISH
+
+    r.load("english")
+    stub.vega.heads = {"urgent": object()}
+    assert r.route(ENGLISH, q).model == "english", "inspect current heads, not a residency snapshot"
+    assert r.route(ENGLISH, {"urgent": Q["urgent"]}).model == VEGA_MODEL
+    assert r.load(VEGA_MODEL) is stub
+
+
+@pytest.mark.parametrize("spec", [True, "4b"])
+def test_fitted_head_lookup_does_not_build_a_lazy_lane(monkeypatch, spec):
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+    r = Router(vega=spec)
+
+    def no_build(key):
+        raise AssertionError("routing metadata must not load a model")
+
+    monkeypatch.setattr(r, "_build", no_build)
+    assert r.route(ENGLISH, Q).model == "english"
+    assert r.loaded == []
+
+
 def test_vega_over_tokens_is_the_line_and_the_estimate_is_characters_over_four():
     stub = _StubVega()
     assert _estimate_tokens("a" * 400) == 100 and _estimate_tokens({"k": "b" * 40}) == 10

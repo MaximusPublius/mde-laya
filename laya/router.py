@@ -853,11 +853,16 @@ class Router(HookRegistry):
         return self._vega_spec is not None
 
     def _vega_heads(self) -> set:
-        """The question ids a resident vega agent has fitted heads for, or nothing."""
-        agent = self._agents.get(VEGA_MODEL)
-        engine = getattr(agent, "vega", None)
-        heads = getattr(engine, "heads", None)
-        return set(heads) if isinstance(heads, dict) else set()
+        """The question ids an available vega agent has fitted heads for, or nothing."""
+        with self._lock:
+            agent = self._agents.get(VEGA_MODEL)
+            if agent is None:
+                # Attached agents survive eviction in _vega_spec and _build can restore them.
+                # Inspect that object without constructing a lazy bool/string specification.
+                agent = self._vega_spec
+            engine = getattr(agent, "vega", None)
+            heads = getattr(engine, "heads", None)
+            return set(heads) if isinstance(heads, dict) else set()
 
     # ------------------------------------------------------------------ registry
     def resolve(self, name: Any) -> str:

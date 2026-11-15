@@ -238,6 +238,43 @@ for label, fn in (("Agent.predict_batch", Agent.predict_batch),
     check_param(label, fn, "hooks_raise", None)
     check_param(label, fn, "hooks_timeout", None)
 
+# Vega's single-result boundary uses the same list-shaped PredictContext as Agent.
+# Exercise the public entries without a checkpoint, including legacy cached dicts.
+_vega_contract = object.__new__(VegaAgent)
+_vega_contract.model_id = "hook-contract"
+_vega_contract.hooks, _vega_contract.hooks_raise, _vega_contract.hooks_timeout = [], True, None
+_vega_contract.max_len = 100
+for _method in ("predict", "system_one", "predict_long"):
+    for _cached in (False, True):
+        _state = {"text": "one state"}
+        _answer = {"answers": {}, "usage": {"input_tokens": 1}}
+        _replacement = {"answers": {"rewritten": True}}
+        _events = []
+
+        def _contract_start(ctx):
+            check("Vega/%s/start states" % _method, ctx.states, [_state])
+            ctx.states = ["rewritten state"]
+            if _cached:
+                ctx.skip(_answer)  # supported legacy Vega payload, normalized before end
+
+        def _contract_decide(state, questions, **kw):
+            check("Vega/%s/rewritten state" % _method, state, "rewritten state")
+            _events.append("decide")
+            return _answer
+
+        def _contract_end(ctx):
+            check("Vega/%s/end results" % _method, ctx.results, [_answer])
+            check("Vega/%s/end usage" % _method, ctx.usage, _answer["usage"])
+            _events.append("end")
+            ctx.results = [_replacement]
+
+        _vega_contract._decide = _contract_decide
+        _out = getattr(_vega_contract, _method)(
+            _state, {}, on_predict_start=_contract_start, on_predict_end=_contract_end
+        )
+        check("Vega/%s/end replacement" % _method, _out["answers"], _replacement["answers"])
+        check("Vega/%s/cached=%s lifecycle" % (_method, _cached), _events, ["end"] if _cached else ["decide", "end"])
+
 # The scan sizes its windows from the checkpoint budget, so it takes `window`/`stride` instead
 # of the per-call token overrides the single-window entries take.
 # The TypeScript predictLong port uses these same long-only controls. Keep the

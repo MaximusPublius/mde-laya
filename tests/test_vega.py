@@ -362,8 +362,8 @@ def test_predict_runs_the_hook_lifecycle(monkeypatch):
     out = a.predict("s", q, hooks=Probe())
     assert out is answer
     assert [e[0] for e in events] == ["start", "end"]
-    assert events[0][1] == "s" and events[0][2] == q, "the hook sees the call's state and questions"
-    assert events[1][1] is answer, "the end hook sees the finished answer"
+    assert events[0][1] == ["s"] and events[0][2] == q, "the hook sees a list of states"
+    assert events[1][1] == [answer], "the end hook sees a list of results"
     assert calls == [("s", q)]
 
 
@@ -385,9 +385,11 @@ def test_a_start_hook_can_short_circuit_and_rewrite_questions(monkeypatch):
     class Rewriter:
         def on_predict_start(self, ctx):
             ctx.questions = other
+            ctx.states = [{"text": "rewritten"}]
 
     a.predict("s", given, hooks=Rewriter())
     assert calls and calls[0][1] is other, "the rewritten questions are what decide on"
+    assert calls[0][0] == {"text": "rewritten"}
 
 
 
@@ -406,7 +408,8 @@ def test_cached_single_result_hook_contract(monkeypatch, method, cache_shape):
 
     def end(ctx):
         events.append("end")
-        assert ctx.results is payload
+        assert ctx.results == [cached]
+        assert ctx.states == ["s"]
 
     result = getattr(a, method)("s", {}, on_predict_start=start, on_predict_end=end)
     assert result["cached"] is True
@@ -418,6 +421,82 @@ def test_cached_single_result_hook_contract(monkeypatch, method, cache_shape):
         assert "usage" not in cached
     else:
         assert result is cached
+
+
+@pytest.mark.parametrize("media", ["image", "audio", "video"])
+def test_media_hooks_use_single_state_and_result_lists(monkeypatch, media):
+    answer = {"answers": {}, "usage": {"input_tokens": 4}}
+    calls, events = [], []
+    a = _hook_agent(monkeypatch, answer, calls)
+    replacement = {"answers": {}, "replaced": True}
+
+    def end(ctx):
+        assert ctx.states == [None]
+        assert ctx.results == [answer]
+        assert ctx.usage == answer["usage"]
+        events.append("end")
+        ctx.results = [replacement]
+
+    assert a.predict(questions={}, on_predict_end=end, **{media: "fixture"}) is replacement
+    assert calls == [(None, {})] and events == ["end"]
+
+
+def test_option_stability_and_documented_end_hook_work_on_vega(monkeypatch):
+    from laya.hooks import OptionStabilityHook
+
+    a = _hook_agent(monkeypatch, {}, [])
+    state = {"text": STATE}
+    q = {"dept": Q["dept"]}
+
+    def decide(self, actual_state, questions, **kw):
+        assert actual_state is state
+        # Return a consistent prediction for each real probe question, without weights.
+        answers = {}
+        for qid, question in questions.items():
+            labels = list(question["criteria"])
+            answers[qid] = {
+                "type": "choice",
+                "choice": labels[0],
+                "probabilities": {label: 1.0 if i == 0 else 0.0 for i, label in enumerate(labels)},
+            }
+        return {"answers": answers, "usage": {"input_tokens": 1}}
+
+    monkeypatch.setattr(lv.VegaAgent, "_decide", decide)
+    seen = []
+    out = a.predict(
+        state,
+        q,
+        hooks=OptionStabilityHook(accept=0.9, escalate=0.5),
+        on_predict_end=lambda ctx: seen.append(ctx.results[0]["answers"]),
+    )
+    assert seen == [out["answers"]]
+    assert set(out["answers"]) == {"dept"}, "the stability hook folds and removes probe answers"
+    assert "stability" in out["answers"]["dept"]["reliability"]
+
+
+def test_inference_errors_keep_list_contexts_and_original_exception(monkeypatch):
+    calls, events = [], []
+    a = _hook_agent(monkeypatch, {}, calls)
+    error = RuntimeError("inference failed")
+
+    def fail(*args, **kw):
+        raise error
+
+    class Probe:
+        def on_error(self, ctx):
+            assert ctx.states == [{"text": STATE}] and ctx.results is None
+            assert ctx.error is error
+            events.append("error")
+
+        def on_predict_end(self, ctx):
+            assert ctx.states == [{"text": STATE}] and ctx.results is None
+            assert ctx.error is error and ctx.elapsed_ms is not None
+            events.append("end")
+
+    monkeypatch.setattr(lv.VegaAgent, "_decide", fail)
+    with pytest.raises(RuntimeError, match="inference failed") as exc:
+        a.predict({"text": STATE}, Q, hooks=Probe())
+    assert exc.value is error and events == ["error", "end"]
 
 
 def test_predict_long_preserves_end_hook_replacement_and_copies_usage(monkeypatch):
@@ -637,6 +716,61 @@ def test_load_calibration_resets_a_calibration_the_directory_does_not_hold(tmp_p
     assert out["calibrated"] is False
     assert a.calibration is None, "a heads-only directory does not vouch for a band"
     assert set(a.vega.heads) == {"dept"}
+
+
+def test_heads_only_overwrite_refuses_stale_calibration_before_writing(tmp_path, monkeypatch):
+    import json
+    import types
+
+    import numpy as np
+
+    class FakeCal:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def save(self, path):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.payload, f)
+
+        @classmethod
+        def from_payload(cls, payload):
+            return cls(payload)
+
+    _fake_vegaml(monkeypatch, FakeCal)
+    a = object.__new__(lv.VegaAgent)
+    a.model_id, a.alpha, a.risk, a.target_precision = "synthetic", "0.1", "0.1", 0.95
+    a.vega = types.SimpleNamespace(heads={}, engine=types.SimpleNamespace(base_sha256=lambda: "a" * 64))
+    a.load_calibration(_heads_dir(tmp_path), verify=False)
+    a.calibration = FakeCal({"band": [0.1, 0.9], "generation": "original"})
+    destination = tmp_path / "policy"
+    assert a.save_calibration(str(destination))["calibrated"] is True
+    before = {p.name: p.read_bytes() for p in destination.iterdir()}
+    a.calibration = None
+    for name in lv.HEAD_ARRAYS:
+        setattr(a.vega.heads["dept"][0], name, np.ones(2))
+    with pytest.raises(ValueError, match="calibration.json; use a fresh directory"):
+        a.save_calibration(str(destination))
+    assert {p.name: p.read_bytes() for p in destination.iterdir()} == before
+
+    # The refused overwrite preserves a verifiable original generation.
+    restored = a.load_calibration(str(destination))
+    assert restored["calibrated"] is True and restored["verified"]["status"] == "integrity"
+    assert a.calibration.payload["generation"] == "original"
+    assert all(np.array_equal(getattr(a.vega.heads["dept"][0], name), np.zeros(2)) for name in lv.HEAD_ARRAYS)
+
+    # The requested new heads can be saved without calibration at a fresh destination,
+    # then overwritten by another heads-only generation and reloaded with verification.
+    a.calibration = None
+    fresh = tmp_path / "fresh"
+    for value in (1, 2):
+        for name in lv.HEAD_ARRAYS:
+            setattr(a.vega.heads["dept"][0], name, np.full(2, value))
+        assert a.save_calibration(str(fresh))["calibrated"] is False
+    a.calibration = FakeCal({"generation": "in-memory"})
+    loaded = a.load_calibration(str(fresh))
+    assert loaded["calibrated"] is False and a.calibration is None
+    assert loaded["verified"] == {"status": "integrity", "signed_by": None, "engine": "matches"}
+    assert all(np.array_equal(getattr(a.vega.heads["dept"][0], name), np.full(2, 2)) for name in lv.HEAD_ARRAYS)
 
 
 def test_load_calibration_loads_the_calibration_the_directory_holds(tmp_path, monkeypatch):
