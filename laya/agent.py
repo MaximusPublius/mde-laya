@@ -35,6 +35,7 @@ from .common import (
     collate_items,
     answer_confidence,
     confidence_from_probs,
+    check_batch_size,
     _resolve_noul_labels,
     _reuse_question_tokens,
     _disable_question_token_reuse,
@@ -296,16 +297,26 @@ def _mps_amp_min_rows() -> int:
 
 
 def _cuda_amp_dtype(checkpoint_default: Optional[str]) -> torch.dtype:
-    """Autocast dtype on CUDA at compute capability >= 8: the checkpoint's `amp_dtype` (bf16 for the
-    shipped checkpoints), or LAYA_CUDA_AMP=fp16|float16|bf16|bfloat16 when set. fp16 stays 2-10x
-    closer to the fp32 forward than bf16 on every shipped checkpoint at the same speed; anything
-    else is ignored. The long spellings count because they are what `agent.dtype` reports back, so
-    the precision a user reads off one response is one they can ask for on the next."""
-    raw = os.environ.get("LAYA_CUDA_AMP", "").lower()
+    """Precision asked for on CUDA: the checkpoint's `amp_dtype` (bf16 for the shipped checkpoints),
+    or LAYA_CUDA_AMP=fp16|float16|bf16|bfloat16|fp32|float32 when set. fp16 stays 2-10x closer to
+    the fp32 forward than bf16 on every shipped checkpoint at the same speed. float32 means no
+    autocast at all, and the caller turns it off rather than autocasting to float32. Below compute
+    capability 8 the caller runs fp16 for either half-precision ask. The long spellings count
+    because they are what `agent.dtype` reports back, so the precision a user reads off one
+    response is one they can ask for on the next. The value is trimmed and lower-cased, an empty
+    one means unset, and anything else raises ValueError: a typo fails the load instead of
+    silently serving the checkpoint's choice."""
+    raw = os.environ.get("LAYA_CUDA_AMP", "").strip().lower()
     if raw in ("fp16", "float16"):
         return torch.float16
     if raw in ("bf16", "bfloat16"):
         return torch.bfloat16
+    if raw in ("fp32", "float32"):
+        return torch.float32
+    if raw:
+        raise ValueError("LAYA_CUDA_AMP=%r is not a CUDA precision; use fp16, float16, bf16, bfloat16, "
+                         "fp32 or float32, or leave it unset for the checkpoint's own amp_dtype"
+                         % os.environ["LAYA_CUDA_AMP"])
     return amp_dtype(checkpoint_default)
 
 
@@ -523,6 +534,17 @@ class Agent(HookRegistry):
     _reduce_overhead = False
     _gate = _InferenceGate()
 
+    def __new__(cls, *args, **kwargs):
+        # `laya.Agent(vegaml=True)` builds a VegaAgent: vegaml's engine behind laya's surface.
+        # The dispatch is here rather than in a factory so that the one argument is the whole
+        # change for a caller, and `isinstance(agent, laya.Agent)` stays true either way.
+        # VegaAgent overrides __new__ itself, so there is no recursion through this branch.
+        vegaml = kwargs.get("vegaml")
+        if vegaml is not None and vegaml is not False and cls is Agent:
+            from .vega import VegaAgent
+            return VegaAgent.__new__(VegaAgent)
+        return object.__new__(cls)
+
     def __init__(
         self,
         model_id_or_path: str = "convaiinnovations/laya",
@@ -545,8 +567,13 @@ class Agent(HookRegistry):
         compile_warmup: bool = True,
         compile_cache: bool = False,
         compile_mode: str = "default",
+        vegaml: Union[bool, str, None] = None,
     ):
         """Load a Laya checkpoint.
+
+        `vegaml=True` (or a size, Hub id or directory) loads vegaml's engine instead and returns
+        a :class:`laya.vega.VegaAgent`; see that module. On this path the argument is accepted
+        so that `vegaml=False`/`None` are legal and mean the ordinary checkpoint.
 
         `backend` selects "eager", "auto", "compile" or "tilelang"; see `laya.backends`.
         It takes precedence over `fast` and `compile`. Omit it to keep those legacy flags.
@@ -796,20 +823,26 @@ class Agent(HookRegistry):
         self.mps_amp_min_rows = _mps_amp_min_rows()
         if self.device.type == "cuda":
             self.amp_enabled = True
-            try:
-                major = torch.cuda.get_device_capability(self.device)[0]
-            except (RuntimeError, AttributeError):
-                # A driver that reports a GPU but cannot answer the capability query
-                # cannot be trusted with bf16 either; fp16 is the safe default and
-                # placement below still decides whether the device is usable at all.
-                warnings.warn("Warning: could not query CUDA capability; assuming fp16 defaults.",
-                              RuntimeWarning)
-                self.dtype = torch.float16
+            # Read on every CUDA device, so a value that does not parse fails here whatever the
+            # GPU, and fp32 means full precision on all of them (#443).
+            requested = _cuda_amp_dtype(self.cfg.get("amp_dtype", "fp16"))
+            if requested == torch.float32:
+                self.amp_enabled = False
             else:
-                if major < 8:
+                try:
+                    major = torch.cuda.get_device_capability(self.device)[0]
+                except (RuntimeError, AttributeError):
+                    # A driver that reports a GPU but cannot answer the capability query
+                    # cannot be trusted with bf16 either; fp16 is the safe default and
+                    # placement below still decides whether the device is usable at all.
+                    warnings.warn("Warning: could not query CUDA capability; assuming fp16 defaults.",
+                                  RuntimeWarning)
                     self.dtype = torch.float16
                 else:
-                    self.dtype = _cuda_amp_dtype(self.cfg.get("amp_dtype", "fp16"))
+                    if major < 8:
+                        self.dtype = torch.float16
+                    else:
+                        self.dtype = requested
         elif self.device.type == "mps":
             self.amp_enabled = True
             self.dtype = torch.float16
@@ -907,12 +940,21 @@ class Agent(HookRegistry):
         matches the stock forward it replaces within rounding (see benchmarks/parity_fast.py). After
         changing `agent.dtype`, call `deaccelerate()` then `accelerate()` to rebuild it. Returns True if
         enabled. With `strict=False` any failure (no CUDA, tilelang missing) leaves the stock path in place.
+        An fp32 agent (`LAYA_CUDA_AMP=fp32`) is such a failure: its kernels only run in 16 bits, so it
+        warns and keeps the stock forward, or raises with `strict=True`.
         """
         if self._fast is not None:
             return True
         if self.device.type != "cuda":
             if strict:
                 raise RuntimeError("laya fast path needs a CUDA device")
+            return False
+        if self.dtype not in (torch.bfloat16, torch.float16):
+            msg = ("laya fast path runs in bf16 or fp16 only and this agent runs %s; "
+                   "keeping the stock forward" % self.dtype)
+            if strict:
+                raise RuntimeError(msg)
+            warnings.warn("Warning: " + msg, RuntimeWarning)
             return False
         if self._backend is not None:
             self.deaccelerate()
@@ -1464,7 +1506,9 @@ class Agent(HookRegistry):
                     The same `questions` are evaluated against every state.
             questions: Question definitions, exactly as accepted by `system_one`.
             batch_size: Optional cap on states per forward pass. `None` sends them all in one pass;
-                        set it to bound peak memory when batching many or long states.
+                        set it to bound peak memory when batching many or long states. A `float`,
+                        a `str` or a `bool` is refused by name -- the count is spent as a `range()`
+                        step, and `0` or a negative integer means the same "no cap" as `None`.
             hooks (HookArg): Per-call hooks, appended after any installed on the Agent.
                     See `laya.hooks`.
             on_predict_start (PredictHookArg): A per-call start hook. It may rewrite the
@@ -1487,6 +1531,7 @@ class Agent(HookRegistry):
             aligned with `states` by index.
         """
         mc = check_min_confidence(min_confidence) if min_confidence is not None else None
+        batch_size = check_batch_size(batch_size)
         active = compose_hooks(self.hooks, hooks, on_predict_start, on_predict_end)
         raise_errors = self.hooks_raise if hooks_raise is None else bool(hooks_raise)
         timeout = self.hooks_timeout if hooks_timeout is None else validate_timeout(hooks_timeout)
@@ -2137,6 +2182,7 @@ def _is_local_checkpoint_arg(model_id_or_path: str) -> bool:
 
 if TYPE_CHECKING:  # pragma: no cover - the annotation below is the only use
     from .onnx_agent import ONNXAgent
+    from .vega import VegaAgent
 
 
 def load(model_id_or_path: str = "convaiinnovations/laya", device: Optional[str] = None,
@@ -2149,8 +2195,12 @@ def load(model_id_or_path: str = "convaiinnovations/laya", device: Optional[str]
          hooks_timeout: Optional[float] = None,
          calibration: Optional[str] = None, backend: Optional[str] = None,
          onnx_path: Optional[str] = None, compile_warmup: bool = True,
-         compile_cache: bool = False, compile_mode: str = "default") -> Union[Agent, "ONNXAgent"]:
+         compile_cache: bool = False, compile_mode: str = "default",
+         vegaml: Union[bool, str, None] = None) -> Union[Agent, "ONNXAgent", "VegaAgent"]:
     """Load a Laya agent.
+
+        laya.load(vegaml=True)                                        # vegaml's engine, laya's API
+        laya.load(vegaml="4b")                                        # a larger reader
 
     `subfolder` picks one checkpoint out of a repo that bundles several:
 
@@ -2175,6 +2225,13 @@ def load(model_id_or_path: str = "convaiinnovations/laya", device: Optional[str]
     `hooks` / `on_predict_start` / `on_predict_end` observe or shape every prediction; see
     `laya.hooks`. `calibration` is the same optional JSON path accepted by `Agent`.
     """
+    if vegaml is not None and vegaml is not False:
+        # vegaml's engine behind laya's surface; everything laya-specific below (registry names,
+        # ONNX, TileLang, torch.compile) is about ModernBERT checkpoints and does not apply.
+        from .vega import VegaAgent
+        return VegaAgent(model_id_or_path if model_id_or_path != "convaiinnovations/laya" else None,
+                         device=device, token=token, vegaml=vegaml, revision=revision, hooks=hooks,
+                         on_predict_start=on_predict_start, on_predict_end=on_predict_end)
     # A registry name or alias resolves to the same (repo, subfolder) the Router would
     # pick, instead of being handed to the Hub as a repo id. A caller who spelled out a
     # subfolder is loading that subfolder of whatever repo they named, so the name is only

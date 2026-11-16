@@ -259,6 +259,36 @@ check_true("guard/score_fallback_flagged",
            harm_result({"type": "score", "score": 1.5, "confidence": 0.5})["passed"] is False)
 check_true("guard/score_fallback_passes", harm_result({"type": "score", "score": 0.53, "confidence": 0.5})["passed"])
 
+from laya.integrations._guard import probability_map
+
+# A remote JSON integer may be wider than a Python float. Refuse it as a malformed numeric field
+# instead of leaking OverflowError from the shared answer guard.
+_wide_guard = LayaTaskGuard(
+    agent=MockLayaAgent(lambda state, questions: {
+        "answers": {"jailbreak": {"type": "noul", "noul": 10 ** 400}}
+    }),
+    action="annotate",
+)
+try:
+    _wide_guard.screen("Summarize this report")
+    check_true("guard/wide_integer_is_malformed", False, "no error raised")
+except RuntimeError as _exc:
+    check_true("guard/wide_integer_is_malformed",
+               "Malformed decision response" in str(_exc), str(_exc))
+except Exception as _exc:
+    check_true("guard/wide_integer_is_malformed", False,
+               "%s: %s" % (type(_exc).__name__, _exc))
+
+try:
+    probability_map({"probabilities": {"choice_0": 10 ** 400}}, ["choice_0"])
+    check_true("guard/wide_probability_is_malformed", False, "no error raised")
+except RuntimeError as _exc:
+    check_true("guard/wide_probability_is_malformed",
+               "Malformed decision response" in str(_exc), str(_exc))
+except Exception as _exc:
+    check_true("guard/wide_probability_is_malformed", False,
+               "%s: %s" % (type(_exc).__name__, _exc))
+
 # --------------------------------------------------------------- 3b. Guard probabilities are robust to a malformed answer
 #
 # `score_violation_probability` reads `probabilities` (and `score`) straight from a decision answer,
@@ -285,6 +315,12 @@ _BAD_DISTRIBUTIONS = {
     "value_str": {"probabilities": {"0": 0.1, "1": 0.1, "2": "high", "3": 0.4}, "score": 1.5},
     "value_none": {"probabilities": {"0": 0.1, "1": 0.1, "2": None, "3": 0.4}, "score": 1.5},
     "value_bool": {"probabilities": {"0": 0.1, "1": 0.1, "2": True, "3": False}, "score": 1.5},
+    "value_nan_string": {"probabilities": {"0": 0.1, "1": 0.1, "2": "NaN", "3": 0.4}, "score": 1.5},
+    "value_inf_string": {"probabilities": {"0": 0.1, "1": 0.1, "2": "Infinity", "3": 0.4}, "score": 1.5},
+    "value_neg_inf_string": {"probabilities": {"0": 0.1, "1": 0.1, "2": "-Infinity", "3": 0.4}, "score": 1.5},
+    "value_overflow_string": {"probabilities": {"0": 0.1, "1": 0.1, "2": "1e10000", "3": 0.4}, "score": 1.5},
+    "value_wide_int": {"probabilities": {"0": 0.1, "1": 0.1, "2": 10 ** 1000, "3": 0.4}, "score": 1.5},
+    "sum_overflow": {"probabilities": {"0": 0.1, "1": 0.1, "2": 1e308, "3": 1e308}, "score": 1.5},
 }
 for _label, _ans in _BAD_DISTRIBUTIONS.items():
     try:
@@ -294,7 +330,9 @@ for _label, _ans in _BAD_DISTRIBUTIONS.items():
         check_true("guardprob/%s_uses_score_fallback" % _label, False, "%s: %s" % (type(_e).__name__, _e))
 
 # A bool score is not a level, and a non-numeric score is not one either: both read as 0.0.
-for _label, _bad_score in (("bool_score_is_zero", True), ("nonnumeric_score_is_zero", "1.5")):
+for _label, _bad_score in (("bool_score_is_zero", True), ("nonnumeric_score_is_zero", "1.5"),
+                           ("nan_score_is_zero", float("nan")), ("inf_score_is_zero", float("inf")),
+                           ("neg_inf_score_is_zero", float("-inf")), ("wide_int_score_is_zero", 10 ** 1000)):
     try:
         check("guardprob/" + _label, score_violation_probability({"score": _bad_score}, 4), 0.0)
     except Exception as _e:

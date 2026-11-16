@@ -175,6 +175,10 @@ check("state_text/dict", "charged twice" in state_text({"body": "charged twice",
 check("state_text/nested", "deep" in state_text({"a": {"b": ["deep"]}}), True)
 check("state_text/list", "x" in state_text(["x", {"y": "z"}]), True)
 check("state_text/none", state_text(None), "")
+check("state_text/plain string", state_text("hello world"), "hello world")
+check("state_text/plain string budget", state_text("hello world", max_chars=5), "hello")
+check("state_text/bytes budget", state_text(b"hello world", max_chars=5), "hello")
+check("state_text/budget truncation halts", state_text(["part1", "part2", "part3"], max_chars=5), "part1")
 # keys must not drive detection: English keys around Hindi content stay non-English
 check("state_text/keys ignored",
       analyse({"subject": "नमस्ते", "body": "ग्राहक से दो बार शुल्क लिया गया"})["is_english"], False)
@@ -860,6 +864,16 @@ check("clamp/nan falls back to neutral", clamp_temperature(float("nan")), 1.0)
 check("clamp/inf falls back to neutral", clamp_temperature(float("inf")), 1.0)
 check("clamp/bools are not temperatures", clamp_temperature(True), 1.0)
 check("clamp/False is not a sharpening zero", clamp_temperature(False), 1.0)
+# A JSON integer wider than a double is not a temperature either. `json.load` keeps arbitrary
+# precision, so a 401-digit literal arrives as an `int` and `float()` answers it with
+# `OverflowError` -- which used to escape the clamp, and every load that calls it, after the
+# checkpoint had already been read off disk. `2 ** 1024` is the smallest power of two `float()`
+# refuses, and the same number written as a JSON *float* (`1e400`) parses as `inf`, which the
+# clamp has always answered with 1.0.
+check("clamp/wide integer falls back to neutral", clamp_temperature(10 ** 400), 1.0)
+check("clamp/negative wide integer falls back to neutral", clamp_temperature(-(10 ** 400)), 1.0)
+check("clamp/smallest unconvertible power of two", clamp_temperature(2 ** 1024), 1.0)
+check("clamp/convertible neighbor still clamps", clamp_temperature(2 ** 1023), TEMP_MAX)
 check("clamp/bounds are sane", TEMP_MIN <= 1.0 <= TEMP_MAX, True)
 # 13 options is the bucket the reported skill-router landed in
 check("clamp/13 options is the 11+ bucket", temp_bucket(QTYPES["choice"], 13), "choice:11+")

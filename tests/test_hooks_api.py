@@ -27,6 +27,7 @@ from laya import Agent, AsyncHook, BaseHook, OptionStabilityHook, PredictContext
 from laya.hooks import HOOK_EVENTS, Hook, calibrate_reliability, decide_reliability  # noqa: E402
 from laya.onnx_agent import ONNXAgent  # noqa: E402
 from laya.router import _question_schema  # noqa: E402
+from laya.vega import VegaAgent  # noqa: E402
 
 PASS, FAIL = [], []
 
@@ -72,6 +73,9 @@ HOOK_KEYS = {
 # --------------------------------------------------------------- constructors
 check("HTTP SDK stays outside core exports", "LayaClient" in laya.__all__, False)
 check("HTTP batch response stays outside core exports", "BatchPrediction" in laya.__all__, False)
+# TS HTTP batch declarations live in sdk/typescript; its public consumer tests pin their shape.
+check("HTTP batch options stay outside core exports", "BatchPredictOptions" in laya.__all__, False)
+check("HTTP aggregate usage stays outside core exports", "BatchUsage" in laya.__all__, False)
 check("core does not import the HTTP SDK", "laya_client" in sys.modules, False)
 
 for label, fn in (("Agent.__init__", Agent.__init__), ("load", load),
@@ -225,19 +229,64 @@ for label, fn in (("Agent.predict_batch", Agent.predict_batch),
                   ("Router.predict", Router.predict),
                   ("Router.predict_batch", Router.predict_batch),
                   ("Router.predict_long", Router.predict_long),
-                  ("ONNXAgent.system_one", ONNXAgent.system_one)):
+                  ("ONNXAgent.system_one", ONNXAgent.system_one),
+                  ("ONNXAgent.predict_long", ONNXAgent.predict_long),
+                  ("VegaAgent.system_one", VegaAgent.system_one)):
     check_param(label, fn, "hooks", None)
     check_param(label, fn, "on_predict_start", None)
     check_param(label, fn, "on_predict_end", None)
     check_param(label, fn, "hooks_raise", None)
     check_param(label, fn, "hooks_timeout", None)
 
+# Vega's single-result boundary uses the same list-shaped PredictContext as Agent.
+# Exercise the public entries without a checkpoint, including legacy cached dicts.
+_vega_contract = object.__new__(VegaAgent)
+_vega_contract.model_id = "hook-contract"
+_vega_contract.hooks, _vega_contract.hooks_raise, _vega_contract.hooks_timeout = [], True, None
+_vega_contract.max_len = 100
+for _method in ("predict", "system_one", "predict_long"):
+    for _cached in (False, True):
+        _state = {"text": "one state"}
+        _answer = {"answers": {}, "usage": {"input_tokens": 1}}
+        _replacement = {"answers": {"rewritten": True}}
+        _events = []
+
+        def _contract_start(ctx):
+            check("Vega/%s/start states" % _method, ctx.states, [_state])
+            ctx.states = ["rewritten state"]
+            if _cached:
+                ctx.skip(_answer)  # supported legacy Vega payload, normalized before end
+
+        def _contract_decide(state, questions, **kw):
+            check("Vega/%s/rewritten state" % _method, state, "rewritten state")
+            _events.append("decide")
+            return _answer
+
+        def _contract_end(ctx):
+            check("Vega/%s/end results" % _method, ctx.results, [_answer])
+            check("Vega/%s/end usage" % _method, ctx.usage, _answer["usage"])
+            _events.append("end")
+            ctx.results = [_replacement]
+
+        _vega_contract._decide = _contract_decide
+        _out = getattr(_vega_contract, _method)(
+            _state, {}, on_predict_start=_contract_start, on_predict_end=_contract_end
+        )
+        check("Vega/%s/end replacement" % _method, _out["answers"], _replacement["answers"])
+        check("Vega/%s/cached=%s lifecycle" % (_method, _cached), _events, ["end"] if _cached else ["decide", "end"])
+
 # The scan sizes its windows from the checkpoint budget, so it takes `window`/`stride` instead
 # of the per-call token overrides the single-window entries take.
-check_param("Agent.predict_long", Agent.predict_long, "window", None)
-check_param("Agent.predict_long", Agent.predict_long, "stride", None)
-for param in ("max_len", "head_max_len"):
-    check("Agent.predict_long/%s not accepted" % param, param in sig(Agent.predict_long), False)
+# The TypeScript predictLong port uses these same long-only controls. Keep the
+# Python oracle's ONNX and Router surfaces pinned alongside the torch entry point.
+for label, fn in (("Agent.predict_long", Agent.predict_long),
+                  ("ONNXAgent.predict_long", ONNXAgent.predict_long),
+                  ("Router.predict_long", Router.predict_long)):
+    for param in ("window", "stride", "batch_size"):
+        check_param(label, fn, param, None)
+    check_param(label, fn, "aggregate", "auto")
+    for param in ("max_len", "head_max_len", "min_confidence"):
+        check("%s/%s not accepted" % (label, param), param in sig(fn), False)
 
 check_param("Agent.predict_batch", Agent.predict_batch, "batch_size", None)
 check_param("Agent.predict_batch", Agent.predict_batch, "sort_by_length", False)
@@ -292,6 +341,44 @@ _explained_analysis = analyse("Turn lights off", explain=True)
 check("analyse opts into one extra key", set(_explained_analysis) - set(_plain_analysis), {"diagnostic"})
 check("analyse diagnostic fields", set(_explained_analysis.pop("diagnostic")), {"stage", "reason", "source"})
 check("analyse retains original fields", _explained_analysis, _plain_analysis)
+
+# Shared source-location contract for TS local diagnostics (lang-diagnostics.test.ts).
+# Both segment and value fallbacks select individual lines. This does not imply
+# detector-wide language parity.
+_diagnostic_state = {
+    "note": "This is an English note about the order. " * 20,
+    "payload": {"messages": [None, 42, "status\n\nIch kann mich nicht anmelden und brauche Hilfe"]},
+}
+_segment_diagnostic = {
+    "stage": "segment", "reason": "named_segment",
+    "source": {"leaf_index": 1, "path": ["payload", "messages", 2], "line": 3},
+}
+check("diagnostic nested segment source", analyse(_diagnostic_state, explain=True)["diagnostic"],
+      _segment_diagnostic)
+_value_diagnostic_state = {
+    "note": "This is an English note about the order. " * 140,
+    "body": "This is an English note about the order. " * 140 + "\n\nIch kann mich nicht anmelden und brauche Hilfe",
+}
+check("diagnostic value source beyond the segment budget", analyse(_value_diagnostic_state, explain=True)["diagnostic"],
+      {"stage": "value", "reason": "named_value", "source": {"leaf_index": 1, "path": ["body"], "line": 3}})
+_diagnostic_router = Router()
+check("route carries detector diagnostic", _diagnostic_router.route(_diagnostic_state, {}, explain=True)
+      ["detection"]["diagnostic"], _segment_diagnostic)
+_diagnostic_batch = _diagnostic_router.route_batch([
+    {"state": _diagnostic_state, "questions": {}},
+    {"state": _diagnostic_state, "questions": {}, "model": "english"},
+], explain=True)
+check("route batch carries diagnostic in order", _diagnostic_batch[0]["detection"]["diagnostic"],
+      _segment_diagnostic)
+check("override bypass has no detector diagnostic", _diagnostic_batch[1]["detection"], None)
+for _key_size in (128, 129):
+    _key = "😀" * _key_size
+    _key_diagnostic = analyse({
+        "note": "This is an English note about the order. " * 20,
+        _key: "Ich kann mich nicht anmelden und brauche Hilfe",
+    }, explain=True)["diagnostic"]
+    check(f"diagnostic key bound {_key_size} code points", _key_diagnostic["source"]["path"],
+          [_key] if _key_size == 128 else None)
 
 # route() and route_batch() take per-call hooks so a hook can pin a checkpoint for one call
 for label, fn in (("Router.route", Router.route),
@@ -425,6 +512,10 @@ from laya.integrations.langchain import (  # noqa: E402
     LayaRouter,
     LayaTriage,
 )
+
+check_param("LayaRouter", LayaRouter.__init__, "decision_policy", "confidence", inspect.Parameter.KEYWORD_ONLY)
+check_param("LayaRouter", LayaRouter.__init__, "confidence_threshold", 0.0, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+check_param("LayaRouter", LayaRouter.__init__, "fallback", None, inspect.Parameter.POSITIONAL_OR_KEYWORD)
 
 for label, cls in (("LayaRouter", LayaRouter), ("LayaGuardrail", LayaGuardrail),
                    ("LayaTriage", LayaTriage), ("LayaEvaluator", LayaEvaluator)):
@@ -1151,6 +1242,15 @@ check("serve/BODY_REFUSALS is the hook argument set LangChain refuses", sorted(_
 check("serve/BODY_REFUSALS names nothing but hooks",
       [key for key in _http_refusals if "hook" not in key and "predict" not in key], [])
 check("serve forwards and refuses disjoint sets", sorted(set(_http_controls) & set(_http_refusals)), [])
+
+from laya.serve import ROUTE_BODY_CONTROLS, ROUTE_BODY_REFUSALS  # noqa: E402
+
+check("HTTP route controls track Router.route", sorted(ROUTE_BODY_CONTROLS),
+      sorted(set(sig(Router.route)) - {"self", "state", "questions"} - set(ROUTE_BODY_REFUSALS)))
+check("HTTP route accepts and refuses disjoint controls",
+      sorted(set(ROUTE_BODY_CONTROLS) & set(ROUTE_BODY_REFUSALS)), [])
+check("HTTP route refuses prediction-only controls and operator hook policy",
+      sorted(set(_http_controls + _http_refusals) - set(ROUTE_BODY_CONTROLS) - set(ROUTE_BODY_REFUSALS)), [])
 
 # The opt-in shortlist evaluator is a public Python entry point. Pin its required
 # provenance arguments without adding an eager import to the package root.
